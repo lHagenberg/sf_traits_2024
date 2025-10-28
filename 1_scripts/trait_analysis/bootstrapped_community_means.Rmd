@@ -29,6 +29,8 @@ require(traitstrap)
 
 # visualization
 require(ggplot2)
+
+require(openxlsx)
 ```
 
 # Data import
@@ -73,14 +75,14 @@ community_data <- read_csv("../snowfence_community/2_data/2_clean_data/vp_pp_lea
     ))) %>%  
   mutate(site = as.factor(substr(plot, 2,2))) %>% # create site variable from plot code
   left_join(species_list, by = "species") %>% 
-  select(plot, habitat, site, treatment, spec, species, family:group, hits)
+  dplyr::select(plot, habitat, site, treatment, spec, species, family:group, hits)
 ```
 
 ```{r}
 # calculate biomass for community
 community_biomass <- community_data %>% 
   left_join(biomass_models, by = "spec") %>% 
-  select(plot:estimate, sig) %>% 
+  dplyr::select(plot:estimate, sig) %>% 
   mutate(biomass = hits * estimate) %>% 
   drop_na(biomass)#%>% 
   #select(!estimate:sig)
@@ -249,6 +251,8 @@ trait_missing(filled_trait = filled_traits_pooled_bm, comm = community_biomass)
 boot_traits_pooled_bm <- trait_np_bootstrap(filled_traits = filled_traits_pooled_bm, nrep = 10, sample_size = 100)
 
 trait_summarise_boot_moments(boot_traits_pooled_bm)
+
+write.csv(boot_traits_pooled_bm, "3_output/Results/bootstrapped_traits_bm.csv")
 ```
 
 ```{r}
@@ -275,3 +279,130 @@ boot_traits_pooled_bm %>%
 
 ggsave("3_output/Figures/bootstrapped_traits_pooled_bmWeighted_2025.svg", height = 4, width = 5)
 ```
+
+# Analysis
+## biomass weighted traits
+```{r}
+# prep bootstrapped trait dataset for analysis
+boot_traits_bm_short <- boot_traits_pooled_bm %>% 
+  dplyr::select(habitat:mean) %>% 
+  group_by(habitat, site, treatment, plot, trait) %>% 
+  mutate(bootstrap_iter = row_number()) %>% 
+  dplyr::select(bootstrap_iter, habitat:mean) %>% 
+  pivot_wider(names_from = trait, values_from = mean)
+```
+### data exploration
+```{r}
+dist <- fitdist(boot_traits_bm_short$wC, "norm")
+plot(dist)
+```
+### model test
+```{r}
+fit <- lm(height ~ treatment * habitat, data = boot_traits_bm_short)
+
+summary(fit)
+car::Anova(fit, type = "II") %>% 
+  tidy()
+glance(fit)
+
+tidy(fit)
+
+# Get EMMs for each treatment-habitat combo
+emm <- emmeans(fit, ~ treatment | habitat)
+pairs(emm, adjust = "tukey") %>%
+  as.data.frame()
+```
+
+```{r trait model diagnostics}
+simulationOutput <- simulateResiduals(fittedModel = fit)
+plot(simulationOutput)
+testDispersion(simulationOutput); rm(simulationOutput)
+
+x <- check_collinearity(fit)
+plot(x); rm(x)
+```
+
+### linear models
+```{r}
+traits <- unique(boot_traits_pooled_bm$trait)
+model_list <- list()
+
+for(tr in traits) {
+  model_list[[tr]] <- lm(mean ~ treatment * habitat, 
+                         data = filter(boot_traits_pooled_bm, trait == tr))
+}
+
+anova(model_list[["SLA"]])
+
+# get model statistics (goodness of fit)
+model_fit <- map_dfr(names(model_list), function(tr) {
+  model <- model_list[[tr]]
+  
+  # Get R-squared
+  mod_stats <- glance(model) %>% 
+    mutate(significance = case_when(
+    p.value < 0.001 ~ "***",
+    p.value < 0.01 ~ "**",
+    p.value < 0.05 ~ "*",
+    p.value < 0.1 ~ ".",
+    TRUE ~ ""
+  ))
+  
+  # Combine with species name
+  bind_cols(spec = tr, mod_stats)
+})
+
+# get hypothesis tests
+hyp_test <- map_dfr(names(model_list), function(tr) {
+  model <- model_list[[tr]]
+  
+  # Get model anovas
+  test <- car::Anova(model, type = "II") %>% 
+    tidy() %>% 
+    mutate(trait = tr) %>% 
+    dplyr::select(trait, everything()) %>% 
+    mutate(significance = case_when(
+    p.value < 0.001 ~ "***",
+    p.value < 0.01 ~ "**",
+    p.value < 0.05 ~ "*",
+    p.value < 0.1 ~ ".",
+    TRUE ~ ""
+  ))
+})
+
+# pairwise comparisons 
+pair_comps <- map_dfr(names(model_list), function(tr) {
+  model <- model_list[[tr]]
+  
+  # Get R-squared
+  emm <- emmeans(model, ~ treatment | habitat)
+  pair_comp <- pairs(emm, adjust = "tukey") %>%
+    as.data.frame() %>% 
+    mutate(trait = tr) %>% 
+    dplyr::select(trait, everything()) %>% 
+    mutate(significance = case_when(
+    p.value < 0.001 ~ "***",
+    p.value < 0.01 ~ "**",
+    p.value < 0.05 ~ "*",
+    p.value < 0.1 ~ ".",
+    TRUE ~ ""
+  ))
+})
+```
+
+```{r}
+# write results to excel file
+wb <- createWorkbook()
+addWorksheet(wb, "model_fit")
+writeData(wb, "model_fit", model_fit)
+
+addWorksheet(wb, "hypothesis_test")
+writeData(wb, "hypothesis_test", hyp_test)
+
+addWorksheet(wb, "pair_comparison")
+writeData(wb, "pair_comparison", pair_comps)
+
+# Save the workbook
+saveWorkbook(wb, "3_output/Results/boot_traits_lm_results.xls", overwrite = TRUE)
+```
+
